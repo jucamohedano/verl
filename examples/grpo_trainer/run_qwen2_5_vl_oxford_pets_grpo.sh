@@ -24,23 +24,27 @@ set -x
 TRAIN_FILE="/leonardo_scratch/fast/EUHPC_D33_243/lmms-ocw/grpo_datasets/oxford_pets/train.parquet"
 VAL_FILE="/leonardo_scratch/fast/EUHPC_D33_243/lmms-ocw/grpo_datasets/oxford_pets/test.parquet"
 REWARD_FN_PATH="/leonardo_scratch/fast/EUHPC_D33_243/verl/verl/utils/reward_score/classification.py"
-CUSTOM_CLS_PATH="/leonardo_scratch/fast/EUHPC_D33_243/verl/examples/custom_dataset/grpo_dataset.py"
 MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"
 unset ROCR_VISIBLE_DEVICES
 export RAY_TMPDIR=/tmp/$USER/ray
+export VLLM_LOGGING_LEVEL=DEBUG
+export VERL_LOG_LEVEL=DEBUG
 mkdir -p $RAY_TMPDIR
 # ---------------------------------------------------------------------------
 # Launch
+
+# data.train_batch_size * actor_rollout_ref.rollout.n must be equally divisible into the number of gpus used
+# so ppo_micro_batch_size_per_gpu must be equal to that amount so that the split is even
 # ---------------------------------------------------------------------------
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$VAL_FILE" \
-    data.train_batch_size=512 \
+    data.train_batch_size=128 \
     data.max_prompt_length=4096 \
-    data.max_response_length=512 \
-    data.filter_overlong_prompts=False \
+    data.max_response_length=64 \
+    data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.image_key=images \
     data.return_raw_chat=True \
@@ -52,8 +56,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -63,13 +67,15 @@ python3 -m verl.trainer.main_ppo \
     \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.prompt_length=4096 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
     \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     \
     algorithm.use_kl_in_reward=False \
@@ -80,12 +86,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name='ttw_grpo_classification' \
-    trainer.experiment_name='qwen2.5_vl_3b_oxford_pets_grpo_lora' \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name='qwen2.5_vl_7b_oxford_pets_grpo_lora' \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
+    trainer.save_freq=5 \
     trainer.test_freq=5 \
-    trainer.total_epochs=15 \
+    trainer.total_epochs=5 \
     trainer.val_before_train=False \
     "$@"
 
