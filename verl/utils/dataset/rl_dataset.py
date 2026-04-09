@@ -193,6 +193,10 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
+                        # NOTE: _build_messages does .pop() which removes the images key from doc.
+                        # We must save raw_images BEFORE calling _build_messages.
+                        raw_images = doc.get(image_key)
+                        raw_videos = doc.get(video_key)
                         messages = self._build_messages(doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
@@ -202,20 +206,24 @@ class RLHFDataset(Dataset):
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
                         )
-                        if image_key in doc and doc[image_key]:
-                            images = [
-                                process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
-                            ]
+                        if raw_images:
+                            try:
+                                images = [
+                                    process_image(image, image_patch_size=self.image_patch_size) for image in raw_images
+                                ]
+                            except Exception as img_e:
+                                logger.warning(f"Failed to process images for idx={doc.get('extra_info', {}).get('index', '?')}: {img_e}")
+                                images = None
                         else:
                             images = None
 
-                        if video_key in doc and doc[video_key]:
+                        if raw_videos:
                             videos, video_metadata = zip(
                                 *[
                                     process_video(
                                         video, image_patch_size=self.image_patch_size, return_video_metadata=True
                                     )
-                                    for video in doc[video_key]
+                                    for video in raw_videos
                                 ],
                                 strict=True,
                             )
@@ -228,20 +236,22 @@ class RLHFDataset(Dataset):
 
                         if images is None and videos is None:
                             # only text prompt
-                            return len(
+                            token_len = len(
                                 processor.tokenizer(
                                     text=raw_prompt,
                                     add_special_tokens=False,  # avoid adding special tokens
                                     return_attention_mask=False,
                                 )["input_ids"]
                             )
+                            return token_len
                         else:
                             # multi-modal prompt
-                            return len(
+                            token_len = len(
                                 processor(text=[raw_prompt], images=images, videos=videos, videos_kwargs=videos_kwargs)[
                                     "input_ids"
                                 ][0]
                             )
+                            return token_len
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
