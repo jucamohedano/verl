@@ -1,110 +1,214 @@
-"""TTW Classification Reward Function for verl GRPO.
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Implements a two-component reward mirroring the GSM8K approach:
+"""Graded classification reward for verl GRPO with attribute extraction.
 
-  1. FORMAT reward  — did the model use <think>...</think><answer>...</answer>?
-  2. CORRECTNESS reward — does the extracted label match ground truth?
+Reward components (max 1.0 per response):
+  format       0.10  - structural validity of <redacted_thinking>/<attrs>/<answer>
+  attributes   0.20  - ConceptNet-verified visual attributes (gated on answer)
+  answer       0.70  - graded by ConceptNet-derived label metadata
 
-Total score per response: 0.0 / 0.5 / 1.0 / 1.5
+Answer tiers (multiplied by 0.70):
+  Specific       1.00  exact match or synonym
+  Less Specific  0.60  parent (single-hop IsA)
+  Generic        0.30  grandparent (two-hop IsA)
+  Sibling        0.15  shares a parent with the ground truth
+  Abstain        0.15  honest refusal
+  Wrong          0.00
 
-verl calls ``compute_score`` once per response with the signature::
+Attribute reward is GATED: zero unless the answer tier is at least Generic.
+This prevents good attributes from compensating for wrong labels.
 
-    compute_score(data_source, solution_str, ground_truth, extra_info=None) -> float
+Expected response format:
+  <redacted_thinking>...</redacted_thinking>
+  <HasProperty>tag1, tag2, tag3</HasProperty>
+  <HasA>tag1, tag2</HasA>
+  <AtLocation>tag1</AtLocation>
+  <answer>label</answer>
 
-To use this file, add to your verl launch script:
-    custom_reward_function.path=/path/to/classification.py
-    custom_reward_function.name=compute_score   # optional, this is the default
+Metadata: one JSON file per lm-eval task name in ``metadata/<task_name>.json``,
+keyed by normalised ground-truth labels (see ``reward_design_v2.md`` in lmms-ocw).
+
+verl launch (example)::
+    custom_reward_function.path=.../classification.py
+    custom_reward_function.name=compute_score
 """
 
+from __future__ import annotations
+
+import json
 import re
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Tag patterns
+# Tunable weights
 # ---------------------------------------------------------------------------
 
-# Requires both tags to be present with content, in the right order.
-# re.DOTALL lets . match newlines inside the tags.
+FORMAT_SCORE = 0.10
+ATTRIBUTE_MAX = 0.20
+ANSWER_MAX = 0.70
+
+TIER_WEIGHTS = {
+    "specific": 1.00,
+    "less_specific": 0.60,
+    "generic": 0.30,
+    "sibling": 0.15,
+    "abstain": 0.15,
+    "wrong": 0.00,
+}
+
+# Tiers at or above which the attribute reward unlocks
+GATING_TIERS = {"specific", "less_specific", "generic"}
+
+RELATIONS = ("HasProperty", "HasA", "AtLocation")
+TARGET_HITS_PER_RELATION = 3
+MAX_TAGS_PER_RELATION = 5  # hard cap before scoring to prevent spam
+
+ABSTAIN_TOKENS = {"none", "n/a", "unknown", "i don't know", "unsure", "cannot tell"}
+
+METADATA_DIR = Path(__file__).resolve().parent / "metadata"
+
+# ---------------------------------------------------------------------------
+# Patterns
+# ---------------------------------------------------------------------------
+
 _FORMAT_PATTERN = re.compile(
-    r"<think>(.+?)</think>\s*<answer>(.+?)</answer>",
+    r"<redacted_thinking>.+?</redacted_thinking>.*?<answer>.+?</answer>",
     re.DOTALL,
 )
-
 _ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+_RELATION_PATTERNS = {rel: re.compile(rf"<{rel}>(.*?)</{rel}>", re.DOTALL) for rel in RELATIONS}
 
 # ---------------------------------------------------------------------------
-# Reward weights — adjust here to change the total scale
+# Metadata loading
 # ---------------------------------------------------------------------------
 
-FORMAT_SCORE = 0.5       # awarded for correct tag structure
-CORRECTNESS_SCORE = 1.0  # awarded for a matching label
+
+def _load_all_metadata() -> dict[str, dict]:
+    tables: dict[str, dict] = {}
+    if not METADATA_DIR.is_dir():
+        return tables
+    for path in METADATA_DIR.glob("*.json"):
+        with open(path, encoding="utf-8") as f:
+            tables[path.stem] = json.load(f)
+    return tables
+
+
+_METADATA = _load_all_metadata()
 
 # ---------------------------------------------------------------------------
-# Normalisation helpers
+# Helpers
 # ---------------------------------------------------------------------------
+
 
 def _normalise(text: str) -> str:
-    """Lowercase and collapse whitespace/punctuation variants.
-
-    Handles common mismatches:
-      - "Yorkshire_Terrier" -> "yorkshire terrier"
-      - "baby-crawling"     -> "baby crawling"
-      - "  striped  "       -> "striped"
-    """
     text = text.lower().strip()
     text = text.replace("_", " ").replace("-", " ")
-    text = re.sub(r"\s+", " ", text)
-    return text
+    return re.sub(r"\s+", " ", text)
 
 
-def _labels_match(predicted: str, ground_truth: str) -> bool:
-    """Normalised exact match (Option A from the reward design doc).
-
-    This is the strictest matching strategy and the cleanest baseline —
-    it mirrors the binary behaviour of the GSM8K reward and makes training
-    dynamics easy to interpret.
-
-    To switch to softer matching (e.g. for dtd or ucf101), replace the body
-    with one of the alternatives below:
-
-    Option B — substring containment (good for oxford_pets breed names):
-        return gt in pred or pred in gt
-
-    Option C — token overlap (good for ucf101 multi-word actions):
-        pred_tokens = set(pred.split())
-        gt_tokens   = set(gt.split())
-        return len(pred_tokens & gt_tokens) / len(gt_tokens) >= 0.8
-    """
-    pred = _normalise(predicted)
-    gt   = _normalise(ground_truth)
-    return pred == gt
+def _extract_tags(solution_str: str, relation: str) -> set[str]:
+    """Pull tags from a relation block, normalised, deduped, capped (comma order)."""
+    match = _RELATION_PATTERNS[relation].search(solution_str)
+    if not match:
+        return set()
+    raw = match.group(1).split(",")
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for t in raw:
+        if not t.strip():
+            continue
+        n = _normalise(t)
+        if n in seen:
+            continue
+        seen.add(n)
+        ordered.append(n)
+        if len(ordered) >= MAX_TAGS_PER_RELATION:
+            break
+    return set(ordered)
 
 
 # ---------------------------------------------------------------------------
-# Component scorers
+# Categorisation
 # ---------------------------------------------------------------------------
+
+
+def _categorise(prediction: str, gt: str, table: dict) -> str:
+    pred = _normalise(prediction)
+    gt_norm = _normalise(gt)
+
+    if pred in ABSTAIN_TOKENS:
+        return "abstain"
+
+    info = table.get(gt_norm, {})
+    parents = {_normalise(s) for s in info.get("parents", [])}
+    grandparents = {_normalise(s) for s in info.get("grandparents", [])}
+    synonyms = {_normalise(s) for s in info.get("synonyms", [])}
+    siblings = {_normalise(s) for s in info.get("siblings", [])}
+
+    if pred == gt_norm or pred in synonyms:
+        return "specific"
+    if pred in parents:
+        return "less_specific"
+    if pred in grandparents:
+        return "generic"
+    if pred in siblings:
+        return "sibling"
+    return "wrong"
+
+
+# ---------------------------------------------------------------------------
+# Component scores
+# ---------------------------------------------------------------------------
+
 
 def _format_score(solution_str: str) -> float:
-    """Return FORMAT_SCORE if the response uses both required tags, else 0.0."""
     return FORMAT_SCORE if _FORMAT_PATTERN.search(solution_str) else 0.0
 
 
-def _correctness_score(solution_str: str, ground_truth: str) -> float:
-    """Return CORRECTNESS_SCORE if the extracted label matches ground truth.
-
-    Returns 0.0 if:
-      - no <answer> tag is present
-      - the extracted label does not match after normalisation
-    """
+def _answer_score_and_tier(solution_str: str, gt: str, table: dict) -> tuple[float, str]:
     match = _ANSWER_PATTERN.search(solution_str)
     if not match:
+        return 0.0, "wrong"
+    tier = _categorise(match.group(1).strip(), gt, table)
+    return ANSWER_MAX * TIER_WEIGHTS[tier], tier
+
+
+def _attribute_score(solution_str: str, gt: str, table: dict, tier: str) -> float:
+    """Mean per-relation hit ratio, scaled to ATTRIBUTE_MAX. Gated on tier."""
+    if tier not in GATING_TIERS:
         return 0.0
-    predicted = match.group(1).strip()
-    return CORRECTNESS_SCORE if _labels_match(predicted, ground_truth) else 0.0
+
+    gt_attrs = table.get(_normalise(gt), {}).get("attributes", {})
+
+    per_relation: list[float] = []
+    for relation in RELATIONS:
+        valid = {_normalise(a) for a in gt_attrs.get(relation, [])}
+        if not valid:
+            continue  # no metadata for this relation, skip
+        hits = len(_extract_tags(solution_str, relation) & valid)
+        per_relation.append(min(1.0, hits / TARGET_HITS_PER_RELATION))
+
+    if not per_relation:
+        return 0.0
+    return ATTRIBUTE_MAX * (sum(per_relation) / len(per_relation))
 
 
 # ---------------------------------------------------------------------------
-# Public entry point — called by verl per response
+# Public entry point
 # ---------------------------------------------------------------------------
+
 
 def compute_score(
     data_source: str,
@@ -112,39 +216,17 @@ def compute_score(
     ground_truth: str,
     extra_info: dict | None = None,
 ) -> float:
-    """Compute the total classification reward for a single model response.
+    """Total reward in [0.0, 1.0] for a single response."""
+    if data_source not in _METADATA:
+        raise KeyError(
+            f"No metadata JSON for data_source={data_source!r} under {METADATA_DIR}. "
+            f"Add {data_source}.json (see lmms-ocw docs/reward_design_v2.md). "
+            f"Available: {sorted(_METADATA)}"
+        )
+    table = _METADATA[data_source]
 
-    Args:
-        data_source:  Task name from the parquet, e.g. "oxford_pets".
-                      Can be used to apply different matching strategies
-                      per dataset (see comments below).
-        solution_str: The model's raw response string (detokenised).
-        ground_truth: The gold label string from reward_model.ground_truth
-                      in the parquet, e.g. "yorkshire terrier".
-        extra_info:   Dict from the parquet's extra_info column.
-                      Contains "gt_label", "split", "index".
-                      Not needed here but available for debugging.
+    fmt = _format_score(solution_str)
+    answer, tier = _answer_score_and_tier(solution_str, ground_truth, table)
+    attrs = _attribute_score(solution_str, ground_truth, table, tier)
 
-    Returns:
-        Float in [0.0, FORMAT_SCORE + CORRECTNESS_SCORE].
-        Currently: 0.0, 0.5, 1.0, or 1.5.
-
-    Per-dataset notes
-    -----------------
-    caltech101  : normalised exact match works well (unambiguous nouns).
-    oxford_pets : normalised exact match works well (breed names).
-    dtd         : consider Option B (substring) for texture adjectives.
-    ucf101      : consider Option C (token overlap) for action phrases.
-
-    To route per dataset, replace the _correctness_score call with:
-
-        if data_source in ("dtd",):
-            correct = _correctness_score_substring(solution_str, ground_truth)
-        elif data_source in ("ucf101",):
-            correct = _correctness_score_token_overlap(solution_str, ground_truth)
-        else:
-            correct = _correctness_score(solution_str, ground_truth)
-    """
-    fmt     = _format_score(solution_str)
-    correct = _correctness_score(solution_str, ground_truth)
-    return fmt + correct
+    return fmt + answer + attrs
