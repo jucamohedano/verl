@@ -5,14 +5,14 @@ Implements a two-component reward mirroring the GSM8K approach:
   1. FORMAT reward  — did the model use <think>...</think><answer>...</answer>?
   2. CORRECTNESS reward — does the extracted label match ground truth?
 
-Total score per response: 0.0 / 0.5 / 1.0 / 1.5 / 2.0
+Total score per response: 0.0 / 0.5 / 1.0 / 1.5
 
 verl calls ``compute_score`` once per response with the signature::
 
     compute_score(data_source, solution_str, ground_truth, extra_info=None) -> float
 
 To use this file, add to your verl launch script:
-    custom_reward_function.path=/path/to/classification_reward.py
+    custom_reward_function.path=/path/to/classification.py
     custom_reward_function.name=compute_score   # optional, this is the default
 """
 
