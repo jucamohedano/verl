@@ -12,104 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Graded classification reward for verl GRPO with attribute extraction.
+"""Binary-answer classification reward with structured think-block scoring.
 
-Reward components (max 1.0 per response):
-  format       0.10  - structural validity of <redacted_thinking>/<attrs>/<answer>
-  attributes   0.20  - ConceptNet-verified visual attributes (gated on answer)
-  answer       0.70  - graded by ConceptNet-derived label metadata
-
-Answer tiers (multiplied by 0.70):
-  Specific       1.00  exact match or synonym
-  Less Specific  0.60  parent (single-hop IsA)
-  Generic        0.30  grandparent (two-hop IsA)
-  Sibling        0.15  shares a parent with the ground truth
-  Abstain        0.15  honest refusal
-  Wrong          0.00
-
-Attribute reward is GATED: zero unless the answer tier is at least Generic.
-This prevents good attributes from compensating for wrong labels.
+v3 reward components (max 1.0 per response):
+  format   0.30  - gated nested ``<think>`` structure plus quality checks
+  answer   0.70  - whole-token substring match after ``</think>``
 
 Expected response format:
-  <redacted_thinking>...</redacted_thinking>
-  <HasProperty>tag1, tag2, tag3</HasProperty>
-  <HasA>tag1, tag2</HasA>
-  <AtLocation>tag1</AtLocation>
-  <answer>label</answer>
+  <think>
+    <HasProperty>tag1, tag2</HasProperty>
+    <HasA>tag1, tag2</HasA>
+    <AtLocation>tag1, tag2</AtLocation>
+  </think>
+  label or natural-language continuation
 
-Metadata: one JSON file per lm-eval task name in ``metadata/<task_name>.json``,
-keyed by normalised ground-truth labels (see ``reward_design_v2.md`` in lmms-ocw).
-
-verl launch (example)::
-    custom_reward_function.path=.../classification.py
-    custom_reward_function.name=compute_score
+No per-class metadata is used. The reward reads only ``ground_truth``.
+spaCy is required at reward time for the format-quality POS sanity check.
 """
 
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
+from functools import lru_cache
 
-# ---------------------------------------------------------------------------
-# Tunable weights
-# ---------------------------------------------------------------------------
-
-FORMAT_SCORE = 0.10
-ATTRIBUTE_MAX = 0.20
+FORMAT_MAX = 0.30
 ANSWER_MAX = 0.70
-
-TIER_WEIGHTS = {
-    "specific": 1.00,
-    "less_specific": 0.60,
-    "generic": 0.30,
-    "sibling": 0.15,
-    "abstain": 0.15,
-    "wrong": 0.00,
-}
-
-# Tiers at or above which the attribute reward unlocks
-GATING_TIERS = {"specific", "less_specific", "generic"}
-
 RELATIONS = ("HasProperty", "HasA", "AtLocation")
-TARGET_HITS_PER_RELATION = 3
-MAX_TAGS_PER_RELATION = 5  # hard cap before scoring to prevent spam
+MIN_ENTRIES_PER_TAG = 2
+MAX_TOKENS_PER_ENTRY = 3
 
-ABSTAIN_TOKENS = {"none", "n/a", "unknown", "i don't know", "unsure", "cannot tell"}
-
-METADATA_DIR = Path(__file__).resolve().parent / "metadata"
-
-# ---------------------------------------------------------------------------
-# Patterns
-# ---------------------------------------------------------------------------
-
-_FORMAT_PATTERN = re.compile(
-    r"<redacted_thinking>.+?</redacted_thinking>.*?<answer>.+?</answer>",
+_THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+_THINK_GATE_PATTERN = re.compile(
+    r"<think>\s*"
+    r".*?<HasProperty>(.+?)</HasProperty>\s*"
+    r".*?<HasA>(.+?)</HasA>\s*"
+    r".*?<AtLocation>(.+?)</AtLocation>\s*"
+    r".*?</think>",
     re.DOTALL,
 )
-_ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
-_RELATION_PATTERNS = {rel: re.compile(rf"<{rel}>(.*?)</{rel}>", re.DOTALL) for rel in RELATIONS}
-
-# ---------------------------------------------------------------------------
-# Metadata loading
-# ---------------------------------------------------------------------------
-
-
-def _load_all_metadata() -> dict[str, dict]:
-    tables: dict[str, dict] = {}
-    if not METADATA_DIR.is_dir():
-        return tables
-    for path in METADATA_DIR.glob("*.json"):
-        with open(path, encoding="utf-8") as f:
-            tables[path.stem] = json.load(f)
-    return tables
-
-
-_METADATA = _load_all_metadata()
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_RELATION_PATTERNS = {
+    rel: re.compile(rf"<{rel}>(.*?)</{rel}>", re.DOTALL) for rel in RELATIONS
+}
 
 
 def _normalise(text: str) -> str:
@@ -118,96 +61,123 @@ def _normalise(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _extract_tags(solution_str: str, relation: str) -> set[str]:
-    """Pull tags from a relation block, normalised, deduped, capped (comma order)."""
-    match = _RELATION_PATTERNS[relation].search(solution_str)
+def _whole_token_substring(needle: str, haystack: str) -> bool:
+    if not needle:
+        return False
+    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])")
+    return bool(pattern.search(haystack))
+
+
+def _split_entries(block: str) -> list[str]:
+    return [_normalise(part) for part in block.split(",") if _normalise(part)]
+
+
+def _extract_relation_entries(think_body: str, relation: str) -> list[str]:
+    match = _RELATION_PATTERNS[relation].search(think_body)
     if not match:
-        return set()
-    raw = match.group(1).split(",")
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for t in raw:
-        if not t.strip():
+        return []
+    return _split_entries(match.group(1))
+
+
+def _extract_post_think_content(solution_str: str) -> str:
+    match = _THINK_PATTERN.search(solution_str)
+    if not match:
+        return solution_str.strip()
+    return solution_str[match.end() :].strip()
+
+
+def _format_gate_passes(solution_str: str) -> bool:
+    return bool(_THINK_GATE_PATTERN.search(solution_str))
+
+
+def _min_content_score(entries_by_relation: dict[str, list[str]]) -> float:
+    scores = []
+    for relation in RELATIONS:
+        entries = entries_by_relation[relation]
+        ok = len(entries) >= MIN_ENTRIES_PER_TAG and all(len(entry) >= 2 for entry in entries)
+        scores.append(1.0 if ok else 0.0)
+    return sum(scores) / len(scores)
+
+
+def _dedup_score(entries_by_relation: dict[str, list[str]]) -> float:
+    scores = []
+    for relation in RELATIONS:
+        entries = entries_by_relation[relation]
+        scores.append(1.0 if len(entries) == len(set(entries)) else 0.0)
+    return sum(scores) / len(scores)
+
+
+@lru_cache(maxsize=1)
+def _get_nlp():
+    try:
+        import spacy
+    except ImportError as exc:
+        raise ImportError(
+            "classification.py reward v3 requires spaCy at reward time. "
+            "Install `spacy` and the `en_core_web_sm` model."
+        ) from exc
+
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError as exc:
+        raise OSError(
+            "classification.py reward v3 requires the spaCy model `en_core_web_sm`. "
+            "Install it with `python -m spacy download en_core_web_sm`."
+        ) from exc
+
+
+def _entry_passes_pos(entry: str, relation: str) -> float:
+    nlp = _get_nlp()
+    doc = nlp(entry)
+    tokens = [tok for tok in doc if not tok.is_space and not tok.is_punct]
+    if not tokens or len(tokens) > MAX_TOKENS_PER_ENTRY:
+        return 0.0
+
+    root = next((tok for tok in tokens if tok.dep_ == "ROOT"), tokens[0])
+    if any(tok.pos_ in {"VERB", "AUX"} for tok in tokens):
+        return 0.0
+
+    if relation == "HasProperty":
+        return 1.0 if root.pos_ in {"ADJ", "NOUN", "PROPN"} else 0.0
+    return 1.0 if root.pos_ in {"NOUN", "PROPN"} else 0.0
+
+
+def _pos_sanity_score(entries_by_relation: dict[str, list[str]]) -> float:
+    relation_scores = []
+    for relation in RELATIONS:
+        entries = entries_by_relation[relation]
+        if not entries:
+            relation_scores.append(0.0)
             continue
-        n = _normalise(t)
-        if n in seen:
-            continue
-        seen.add(n)
-        ordered.append(n)
-        if len(ordered) >= MAX_TAGS_PER_RELATION:
-            break
-    return set(ordered)
-
-
-# ---------------------------------------------------------------------------
-# Categorisation
-# ---------------------------------------------------------------------------
-
-
-def _categorise(prediction: str, gt: str, table: dict) -> str:
-    pred = _normalise(prediction)
-    gt_norm = _normalise(gt)
-
-    if pred in ABSTAIN_TOKENS:
-        return "abstain"
-
-    info = table.get(gt_norm, {})
-    parents = {_normalise(s) for s in info.get("parents", [])}
-    grandparents = {_normalise(s) for s in info.get("grandparents", [])}
-    synonyms = {_normalise(s) for s in info.get("synonyms", [])}
-    siblings = {_normalise(s) for s in info.get("siblings", [])}
-
-    if pred == gt_norm or pred in synonyms:
-        return "specific"
-    if pred in parents:
-        return "less_specific"
-    if pred in grandparents:
-        return "generic"
-    if pred in siblings:
-        return "sibling"
-    return "wrong"
-
-
-# ---------------------------------------------------------------------------
-# Component scores
-# ---------------------------------------------------------------------------
+        entry_scores = [_entry_passes_pos(entry, relation) for entry in entries]
+        relation_scores.append(sum(entry_scores) / len(entry_scores))
+    return sum(relation_scores) / len(relation_scores)
 
 
 def _format_score(solution_str: str) -> float:
-    return FORMAT_SCORE if _FORMAT_PATTERN.search(solution_str) else 0.0
-
-
-def _answer_score_and_tier(solution_str: str, gt: str, table: dict) -> tuple[float, str]:
-    match = _ANSWER_PATTERN.search(solution_str)
-    if not match:
-        return 0.0, "wrong"
-    tier = _categorise(match.group(1).strip(), gt, table)
-    return ANSWER_MAX * TIER_WEIGHTS[tier], tier
-
-
-def _attribute_score(solution_str: str, gt: str, table: dict, tier: str) -> float:
-    """Mean per-relation hit ratio, scaled to ATTRIBUTE_MAX. Gated on tier."""
-    if tier not in GATING_TIERS:
+    if not _format_gate_passes(solution_str):
         return 0.0
 
-    gt_attrs = table.get(_normalise(gt), {}).get("attributes", {})
-
-    per_relation: list[float] = []
-    for relation in RELATIONS:
-        valid = {_normalise(a) for a in gt_attrs.get(relation, [])}
-        if not valid:
-            continue  # no metadata for this relation, skip
-        hits = len(_extract_tags(solution_str, relation) & valid)
-        per_relation.append(min(1.0, hits / TARGET_HITS_PER_RELATION))
-
-    if not per_relation:
+    think_match = _THINK_PATTERN.search(solution_str)
+    if not think_match:
         return 0.0
-    return ATTRIBUTE_MAX * (sum(per_relation) / len(per_relation))
+    think_body = think_match.group(1)
+
+    entries_by_relation = {
+        relation: _extract_relation_entries(think_body, relation) for relation in RELATIONS
+    }
+    quality = (
+        _min_content_score(entries_by_relation)
+        + _pos_sanity_score(entries_by_relation)
+        + _dedup_score(entries_by_relation)
+    ) / 3.0
+    return FORMAT_MAX * quality
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def _answer_score(solution_str: str, ground_truth: str) -> float:
+    pred = _normalise(_extract_post_think_content(solution_str))
+    gt = _normalise(ground_truth)
+    return ANSWER_MAX if _whole_token_substring(gt, pred) else 0.0
 
 
 def compute_score(
@@ -216,17 +186,6 @@ def compute_score(
     ground_truth: str,
     extra_info: dict | None = None,
 ) -> float:
-    """Total reward in [0.0, 1.0] for a single response."""
-    if data_source not in _METADATA:
-        raise KeyError(
-            f"No metadata JSON for data_source={data_source!r} under {METADATA_DIR}. "
-            f"Add {data_source}.json (see lmms-ocw docs/reward_design_v2.md). "
-            f"Available: {sorted(_METADATA)}"
-        )
-    table = _METADATA[data_source]
-
-    fmt = _format_score(solution_str)
-    answer, tier = _answer_score_and_tier(solution_str, ground_truth, table)
-    attrs = _attribute_score(solution_str, ground_truth, table, tier)
-
-    return fmt + answer + attrs
+    """Compute the v3 reward in [0, 1] for a single response."""
+    del data_source, extra_info
+    return _format_score(solution_str) + _answer_score(solution_str, ground_truth)
