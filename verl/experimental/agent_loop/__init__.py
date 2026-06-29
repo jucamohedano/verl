@@ -13,9 +13,16 @@
 # limitations under the License.
 
 from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
+from .iterative_resample_agent_loop import IterativeResampleAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, IterativeResampleAgentLoop]
 
-__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker"]
+__all__ = [
+    "AgentLoopBase",
+    "AgentLoopManager",
+    "AsyncLLMServerManager",
+    "AgentLoopWorker",
+    "IterativeResampleAgentLoop",
+]

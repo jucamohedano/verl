@@ -1,0 +1,19 @@
+- name: iterative_resample
+  _target_: verl.experimental.agent_loop.iterative_resample_agent_loop.IterativeResampleAgentLoop
+
+  # n: independent samples per round from the same current context.
+  attempts_per_round: 5
+
+  # T: maximum number of grouped resampling rounds.
+  max_rounds: 3
+
+  # Keep each attempt bounded so n*T attempts plus feedback fit in the rollout
+  # response/context budget. Increase for tasks that need longer reasoning.
+  per_attempt_max_tokens: 768
+
+  # Prevent very long failed attempts from dominating the next-round prompt.
+  max_feedback_chars: 6000
+
+  # When false, each round re-samples from the original prompt without feeding
+  # back failed attempts. This degrades to pure best-of-(n*T) sampling.
+  enable_feedback: true
