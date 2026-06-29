@@ -19,10 +19,11 @@ from .agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from .iterative_resample_agent_loop import IterativeResampleAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, IterativeResampleAgentLoop]
 
 __all__ = [
     "AgentLoopBase",
@@ -30,4 +31,5 @@ __all__ = [
     "AgentLoopWorker",
     "AgentLoopOutput",
     "get_trajectory_info",
+    "IterativeResampleAgentLoop",
 ]

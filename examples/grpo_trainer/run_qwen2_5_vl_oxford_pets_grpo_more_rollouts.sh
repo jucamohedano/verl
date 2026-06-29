@@ -66,7 +66,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.n=10 \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.prompt_length=2048 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
@@ -86,13 +86,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name='ttw_grpo_classification' \
-    trainer.experiment_name='qwen2.5_vl_7b_oxford_pets_grpo_lora' \
+    trainer.experiment_name='qwen2.5_vl_7b_oxford_pets_grpo_lora_more_rollouts' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=5 \
     trainer.total_epochs=5 \
     trainer.val_before_train=False \
+    trainer.resume_mode="auto" \
     "$@"
 
 rm -rf $RAY_TMPDIR
