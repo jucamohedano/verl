@@ -10,7 +10,7 @@ set -x
 VERL_ROOT=${VERL_ROOT:-/leonardo_scratch/fast/EUHPC_D33_243/verl}
 OVEN_ROOT=${OVEN_ROOT:-/leonardo_scratch/fast/EUHPC_D33_243/oven-mllm-eval}
 FAST=${FAST:-/leonardo_scratch/fast/EUHPC_D33_243}
-CONDA_ENV=${CONDA_ENV:-verl-vllm110}
+CONDA_ENV=${CONDA_ENV:-verl-v080}
 CONDA_SH=${CONDA_SH:-}
 USE_CONDA=${USE_CONDA:-1}
 VERL_VENV=${VERL_VENV:-"${VERL_ROOT}/.venv"}
@@ -39,7 +39,6 @@ PYTORCH_NVML_BASED_CUDA_CHECK=${PYTORCH_NVML_BASED_CUDA_CHECK:-1}
 CUDA_MODULE_LOADING=${CUDA_MODULE_LOADING:-LAZY}
 VERL_IMPORT_PROBE=${VERL_IMPORT_PROBE:-0}
 KEEP_RAY_TMPDIR_ON_FAILURE=${KEEP_RAY_TMPDIR_ON_FAILURE:-1}
-VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS=${VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS:-nccl,nixl,hccl,kimi,mooncake}
 
 DATASET_DIR=${DATASET_DIR:-"${OVEN_ROOT}/data/processed/verl_oven_rsa_trace_smoke_512"}
 TRAIN_FILE=${TRAIN_FILE:-"${DATASET_DIR}/train.parquet"}
@@ -56,13 +55,16 @@ N_GPUS=${N_GPUS:-4}
 N_NODES=${N_NODES:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
-PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 ROLLOUT_N=${ROLLOUT_N:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-4}
 ROLLOUT_GPU_UTIL=${ROLLOUT_GPU_UTIL:-${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.50}}
 ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-1}
-LOGPROB_MICRO_BATCH_SIZE_PER_GPU=${LOGPROB_MICRO_BATCH_SIZE_PER_GPU:-2}
-REF_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=${REF_LOGPROB_MICRO_BATCH_SIZE_PER_GPU:-2}
+# v0.8.0 canonical Qwen3-VL rollout knobs (match examples/grpo_trainer/run_qwen3_vl_8b_fsdp.sh).
+# enforce_eager=True is kept for LoRA-merge safety (avoids stale CUDA graphs across weight syncs).
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
+ROLLOUT_ENABLE_CHUNKED_PREFILL=${ROLLOUT_ENABLE_CHUNKED_PREFILL:-False}
+ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
 
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
@@ -90,6 +92,11 @@ fi
 MODEL_USE_REMOVE_PADDING=${MODEL_USE_REMOVE_PADDING:-True}
 MODEL_USE_FUSED_KERNELS=${MODEL_USE_FUSED_KERNELS:-True}
 MODEL_ENABLE_GRADIENT_CHECKPOINTING=${MODEL_ENABLE_GRADIENT_CHECKPOINTING:-False}
+# attn_implementation: "flash_attention_2" (needs flash_attn, required when use_remove_padding/use_fused_kernels=True),
+# or "sdpa" (PyTorch built-in, no flash_attn) for the no-flash smoke. Note: use_remove_padding=True and
+# use_fused_kernels=True hard-import flash_attn (verl attention_utils / monkey_patch), so a flash_attn-free
+# run must set BOTH to False alongside attn_implementation=sdpa.
+MODEL_ATTN_IMPLEMENTATION=${MODEL_ATTN_IMPLEMENTATION:-flash_attention_2}
 ACTOR_STRATEGY=${ACTOR_STRATEGY:-fsdp2}
 REF_STRATEGY=${REF_STRATEGY:-fsdp2}
 ACTOR_FSDP_SIZE=${ACTOR_FSDP_SIZE:--1}
@@ -174,38 +181,11 @@ export WANDB_MODE WANDB_DIR
 export VLLM_ALLREDUCE_USE_SYMM_MEM VLLM_USE_V1
 export HYDRA_FULL_ERROR RAY_DEDUP_LOGS
 export PYTHONFAULTHANDLER TORCH_SHOW_CPP_STACKTRACES TORCH_DISABLE_ADDR2LINE PYTORCH_NVML_BASED_CUDA_CHECK CUDA_MODULE_LOADING
-export VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS
 export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/r${SLURM_JOB_ID:-$$}}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARN}
 unset ROCR_VISIBLE_DEVICES
 mkdir -p "$RAY_TMPDIR" "$CKPTS_DIR" "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$TMPDIR" \
     "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$HF_DATASETS_CACHE" "$WANDB_DIR"
-
-SITE_CUSTOMIZE_DIR="$RAY_TMPDIR/sitecustomize"
-mkdir -p "$SITE_CUSTOMIZE_DIR"
-cat > "$SITE_CUSTOMIZE_DIR/sitecustomize.py" <<'PY'
-import importlib.abc
-import os
-import sys
-
-blocked = {
-    f"verl.checkpoint_engine.{name.strip()}_checkpoint_engine"
-    for name in os.environ.get("VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS", "").split(",")
-    if name.strip()
-}
-
-
-class _BlockOptionalCheckpointBackends(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname in blocked:
-            raise ImportError(f"{fullname} disabled by VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS")
-        return None
-
-
-if blocked:
-    sys.meta_path.insert(0, _BlockOptionalCheckpointBackends())
-PY
-export PYTHONPATH="$SITE_CUSTOMIZE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 cleanup() {
     status=$?
@@ -291,14 +271,16 @@ fi
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.model.lora_rank="$LORA_RANK" \
     actor_rollout_ref.model.lora_alpha="$LORA_ALPHA" \
-    +actor_rollout_ref.model.lora.merge="$LORA_MERGE" \
+    actor_rollout_ref.model.lora.merge="$LORA_MERGE" \
     actor_rollout_ref.model.use_remove_padding="$MODEL_USE_REMOVE_PADDING" \
     actor_rollout_ref.model.use_fused_kernels="$MODEL_USE_FUSED_KERNELS" \
     actor_rollout_ref.model.enable_gradient_checkpointing="$MODEL_ENABLE_GRADIENT_CHECKPOINTING" \
+    +actor_rollout_ref.model.override_config.attn_implementation="$MODEL_ATTN_IMPLEMENTATION" \
     \
     actor_rollout_ref.actor.optim.lr="$LR" \
     actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="$PPO_MICRO_BATCH_SIZE_PER_GPU" \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef="$KL_COEF" \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -311,7 +293,9 @@ fi
     \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n="$ROLLOUT_N" \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
+    actor_rollout_ref.rollout.enable_chunked_prefill="$ROLLOUT_ENABLE_CHUNKED_PREFILL" \
+    actor_rollout_ref.rollout.free_cache_engine="$ROLLOUT_FREE_CACHE_ENGINE" \
     actor_rollout_ref.rollout.prompt_length="$MAX_PROMPT_LENGTH" \
     actor_rollout_ref.rollout.max_model_len="$ROLLOUT_MAX_MODEL_LEN" \
     actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
@@ -319,14 +303,13 @@ fi
     actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP" \
     actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_UTIL" \
     actor_rollout_ref.rollout.agent.num_workers="$ROLLOUT_AGENT_NUM_WORKERS" \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="$LOGPROB_MICRO_BATCH_SIZE_PER_GPU" \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=naive \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image="$ROLLOUT_LIMIT_IMAGES" \
     \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="$REF_LOGPROB_MICRO_BATCH_SIZE_PER_GPU" \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.ref.strategy="$REF_STRATEGY" \
     actor_rollout_ref.ref.fsdp_config.model_dtype="$REF_MODEL_DTYPE" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -366,6 +349,5 @@ fi
     +ray_kwargs.ray_init.runtime_env.env_vars.TORCH_DISABLE_ADDR2LINE="'$TORCH_DISABLE_ADDR2LINE'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_NVML_BASED_CUDA_CHECK="'$PYTORCH_NVML_BASED_CUDA_CHECK'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.CUDA_MODULE_LOADING="$CUDA_MODULE_LOADING" \
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS="'$VERL_DISABLE_OPTIONAL_CHECKPOINT_BACKENDS'" \
-    +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="$PYTHONPATH" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="${PYTHONPATH:-}" \
     "$@"
