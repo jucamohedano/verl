@@ -197,9 +197,21 @@ while [[ $# -gt 0 ]]; do
         --steps)                 TOTAL_TRAINING_STEPS="$2"; shift 2 ;;
         --save-freq)             SAVE_FREQ="$2"; shift 2 ;;
         --test-freq)             TEST_FREQ="$2"; shift 2 ;;
+        --val-batch-size)         VAL_BATCH_SIZE="$2"; shift 2 ;;
         --val-before-train)      VAL_BEFORE_TRAIN="$2"; shift 2 ;;
         --exp-name)              EXP_NAME="$2"; shift 2 ;;
         --project-name)          PROJECT_NAME="$2"; shift 2 ;;
+        --train-batch-size)      TRAIN_BATCH_SIZE="$2"; shift 2 ;;
+        --ppo-mini-batch-size)   PPO_MINI_BATCH_SIZE="$2"; shift 2 ;;
+        --rollout-n)             ROLLOUT_N="$2"; shift 2 ;;
+        --rollout-tp)            ROLLOUT_TP="$2"; shift 2 ;;
+        --rollout-agents)        ROLLOUT_AGENT_NUM_WORKERS="$2"; shift 2 ;;
+        --rollout-min-model-len) ROLLOUT_MIN_MODEL_LEN="$2"; shift 2 ;;
+        --max-prompt-length)     MAX_PROMPT_LENGTH="$2"; shift 2 ;;
+        --max-response-length)   MAX_RESPONSE_LENGTH="$2"; shift 2 ;;
+        --total-epochs)          TOTAL_EPOCHS="$2"; shift 2 ;;
+        --gpu-util)              ROLLOUT_GPU_UTIL="$2"; shift 2 ;;
+        --max-token-len-per-gpu) PPO_MAX_TOKEN_LEN_PER_GPU="$2"; shift 2 ;;
         --taxonomy-index)        OVEN_TAXONOMY_INDEX="$2"; shift 2 ;;
         --reward-fn)             REWARD_FN_PATH="$2"; shift 2 ;;
         --ckpts-dir)             CKPTS_DIR="$2"; shift 2 ;;
@@ -309,6 +321,8 @@ case "$MODE" in
         LORA_MERGE="${LORA_MERGE:-True}"
         MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
         MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-512}"
+        MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-4096}"
+        VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$MAX_VAL_SAMPLES}"
         RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY:-17179869184}"
         ;;
     *)
@@ -451,6 +465,8 @@ export ROLLOUT_ENABLE_CHUNKED_PREFILL=$(shell_quote "$ROLLOUT_ENABLE_CHUNKED_PRE
 export ROLLOUT_FREE_CACHE_ENGINE=$(shell_quote "$ROLLOUT_FREE_CACHE_ENGINE")
 export MAX_PROMPT_LENGTH=$(shell_quote "$MAX_PROMPT_LENGTH")
 export MAX_RESPONSE_LENGTH=$(shell_quote "$MAX_RESPONSE_LENGTH")
+export MAX_VAL_SAMPLES=$(shell_quote "$MAX_VAL_SAMPLES")
+export VAL_BATCH_SIZE=$(shell_quote "$VAL_BATCH_SIZE")
 export ROLLOUT_MAX_MODEL_LEN=$(shell_quote "$ROLLOUT_MAX_MODEL_LEN")
 export ROLLOUT_MAX_NUM_SEQS=$(shell_quote "$ROLLOUT_MAX_NUM_SEQS")
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS=$(shell_quote "$ROLLOUT_MAX_NUM_BATCHED_TOKENS")
