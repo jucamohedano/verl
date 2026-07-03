@@ -212,6 +212,7 @@ while [[ $# -gt 0 ]]; do
         --total-epochs)          TOTAL_EPOCHS="$2"; shift 2 ;;
         --gpu-util)              ROLLOUT_GPU_UTIL="$2"; shift 2 ;;
         --max-token-len-per-gpu) PPO_MAX_TOKEN_LEN_PER_GPU="$2"; shift 2 ;;
+        --max-num-seqs)          ROLLOUT_MAX_NUM_SEQS="$2"; shift 2 ;;
         --taxonomy-index)        OVEN_TAXONOMY_INDEX="$2"; shift 2 ;;
         --reward-fn)             REWARD_FN_PATH="$2"; shift 2 ;;
         --ckpts-dir)             CKPTS_DIR="$2"; shift 2 ;;
@@ -304,7 +305,7 @@ case "$MODE" in
         ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
         ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-False}"
         ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-True}"
-        ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-64}"
+        ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-16}"
         ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-20000}"
         ROLLOUT_LIMIT_IMAGES="${ROLLOUT_LIMIT_IMAGES:-1}"
         MODEL_USE_REMOVE_PADDING="${MODEL_USE_REMOVE_PADDING:-True}"
