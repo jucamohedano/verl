@@ -290,9 +290,10 @@ case "$MODE" in
         ;;
     full)
         DATASET_DIR="${DATASET_DIR:-$OVEN_ROOT/data/processed/verl_oven_rsa_trace_aligned_balanced_qid_250k_seed42}"
-        TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-100}"
-        SAVE_FREQ="${SAVE_FREQ:-25}"
-        TEST_FREQ="${TEST_FREQ:-25}"
+        TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-300}"
+        TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
+        SAVE_FREQ="${SAVE_FREQ:-100}"
+        TEST_FREQ="${TEST_FREQ:-150}"
         VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
         EXP_NAME="${EXP_NAME:-qwen3_vl_4b_oven_rsa_trace_250k_lora}"
         TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
@@ -450,6 +451,7 @@ export CKPTS_DIR=$(shell_quote "$CKPTS_DIR")
 export N_GPUS=$(shell_quote "$SLURM_GPUS")
 export N_NODES=1
 export TOTAL_TRAINING_STEPS=$(shell_quote "$TOTAL_TRAINING_STEPS")
+export TOTAL_EPOCHS=$(shell_quote "$TOTAL_EPOCHS")
 export SAVE_FREQ=$(shell_quote "$SAVE_FREQ")
 export TEST_FREQ=$(shell_quote "$TEST_FREQ")
 export VAL_BEFORE_TRAIN=$(shell_quote "$VAL_BEFORE_TRAIN")
