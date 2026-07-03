@@ -377,8 +377,36 @@ def _extract_traversal_nodes(text: str) -> list[str]:
     return unique
 
 
+def _longest_common_subsequence(seq1: list[str], seq2: list[str]) -> int:
+    """Length of the longest common subsequence (order-preserving, gaps allowed)."""
+    m, n = len(seq1), len(seq2)
+    if m == 0 or n == 0:
+        return 0
+    # Use 1D DP — O(m*n) time, O(min(m,n)) space
+    if m < n:
+        seq1, seq2 = seq2, seq1
+        m, n = n, m
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        curr = [0] * (n + 1)
+        for j in range(1, n + 1):
+            if seq1[i - 1] == seq2[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(prev[j], curr[j - 1])
+        prev = curr
+    return prev[n]
+
+
 def _path_match_score(traversal_nodes: list[str], gt_path: list[str]) -> float:
-    """Jaccard overlap between traversal-mentioned nodes and GT taxonomy path nodes."""
+    """Path matching score combining F1 (set overlap) and CSS (order fidelity).
+
+    Follows the Traversal paper (Zhang et al., 2511.05933):
+      PathMatch = (F1 + CSS) / 2
+
+    where CSS = LCS(predicted, ground_truth) / |ground_truth|, normalised by
+    ground-truth length to reward getting the right nodes in the right order.
+    """
     if not traversal_nodes or not gt_path:
         return 0.0
 
@@ -386,11 +414,21 @@ def _path_match_score(traversal_nodes: list[str], gt_path: list[str]) -> float:
     traversal_set = set(traversal_nodes)
 
     intersection = traversal_set & gt_norms
-    union = traversal_set | gt_norms
-
-    if not union:
+    if not intersection:
         return 0.0
-    return len(intersection) / len(union)
+
+    # F1: harmonic mean of precision and recall over ancestor sets
+    p = len(intersection) / len(traversal_set) if traversal_set else 0.0
+    r = len(intersection) / len(gt_norms) if gt_norms else 0.0
+    f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+
+    # CSS: longest common subsequence normalised by GT path length
+    # Build ordered lists of normalised nodes
+    gt_ordered = [normalize_answer(n) for n in gt_path if n]
+    lcs_len = _longest_common_subsequence(traversal_nodes, gt_ordered)
+    css = lcs_len / len(gt_ordered) if gt_ordered else 0.0
+
+    return (f1 + css) / 2.0
 
 
 # ---------------------------------------------------------------------------
